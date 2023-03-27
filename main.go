@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"strings"
@@ -27,6 +28,33 @@ import (
 
 	"github.com/joeig/go-powerdns/v3"
 )
+
+func findZone(permittedZones []string, fqdn string) (string, string, error) {
+	// Find out if the fqdn already is in one of the permitted zones
+	for _, zone := range permittedZones {
+		if zone == fqdn || strings.HasSuffix(fqdn, "."+zone) {
+			klog.InfoS("findZone hit", "fqdn", fqdn, "zone", zone)
+			return fqdn, zone, nil
+		}
+	}
+
+	// Has a CNAME been set up from _acme-challenge.something.tld to somewhere we can edit?
+	cname, err := net.LookupCNAME(fqdn)
+	if err != nil {
+		klog.ErrorS(err, "LookupCNAME", "record", fqdn)
+		return "", "", err
+	}
+	if err == nil && cname != "" {
+		for _, zone := range permittedZones {
+			if zone == cname || strings.HasSuffix(cname, "."+zone) {
+				klog.InfoS("findZone CNAME hit", "fqdn", fqdn, "zone", zone)
+				return cname, zone, nil
+			}
+		}
+	}
+
+	return "", "", fmt.Errorf("Could not find any way to create %s", fqdn)
+}
 
 var GroupName = os.Getenv("GROUP_NAME")
 
@@ -153,6 +181,13 @@ func (c *powerDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
 		return fmt.Errorf("failed initializing powerdns provider: %v", err)
 	}
 
+	otherrecord, otherzone, err := findZone(cfg.AllowedZones, ch.ResolvedFQDN)
+	if err != nil {
+		return fmt.Errorf("Could not find editable zone for %s (allowed zones are %v / err '%s')", ch.ResolvedZone, cfg.AllowedZones, err)
+	}
+	ch.ResolvedFQDN = otherrecord
+	ch.ResolvedZone = otherzone
+
 	if !cfg.IsAllowedZone(ch.ResolvedZone) {
 		return fmt.Errorf("zone %s may not be edited per config (allowed zones are %v)", ch.ResolvedZone, cfg.AllowedZones)
 	}
@@ -161,12 +196,14 @@ func (c *powerDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
 	if err != nil {
 		return fmt.Errorf("failed loading existing records for %s in domain %s: %v", ch.ResolvedFQDN, ch.ResolvedZone, err)
 	}
+	klog.InfoS("Got existing records", "resolvedFQDN", ch.ResolvedFQDN, "recordsCount", len(records))
 
 	// Add the record, only if it doesn't exist already
 	content := quote(ch.Key)
 	if _, ok := findRecord(records, content); !ok {
 		disabled := false
 		records = append(records, powerdns.Record{Disabled: &disabled, Content: &content})
+		//klog.InfoS("Appended record", "resolvedFQDN", ch.ResolvedFQDN)
 	}
 
 	txtType := powerdns.RRTypeTXT
@@ -180,7 +217,14 @@ func (c *powerDNSProviderSolver) Present(ch *v1alpha1.ChallengeRequest) error {
 		Records:    records,
 	}
 
-	return provider.Records.Patch(ctx, ch.ResolvedZone, &powerdns.RRsets{Sets: []powerdns.RRset{rrset}})
+	err = provider.Records.Patch(ctx, ch.ResolvedZone, &powerdns.RRsets{Sets: []powerdns.RRset{rrset}})
+	if err != nil {
+		return fmt.Errorf("failed to create record: %s", err)
+	}
+
+	klog.InfoS("Created record", "resolvedFQDN", ch.ResolvedFQDN, "rrset", rrset)
+
+	return nil
 }
 
 // CleanUp should delete the relevant TXT record from the DNS provider console.
@@ -197,6 +241,17 @@ func (c *powerDNSProviderSolver) CleanUp(ch *v1alpha1.ChallengeRequest) error {
 	provider, cfg, err := c.init(ch.Config, ch.ResourceNamespace)
 	if err != nil {
 		return fmt.Errorf("failed initializing powerdns provider: %v", err)
+	}
+
+	otherrecord, otherzone, err := findZone(cfg.AllowedZones, ch.ResolvedFQDN)
+	if err != nil {
+		return fmt.Errorf("zone %s may not be edited per config (allowed zones are %v)", ch.ResolvedZone, cfg.AllowedZones)
+	}
+	ch.ResolvedFQDN = otherrecord
+	ch.ResolvedZone = otherzone
+
+	if !cfg.IsAllowedZone(ch.ResolvedZone) {
+		return fmt.Errorf("zone %s may not be edited per config (allowed zones are %v)", ch.ResolvedZone, cfg.AllowedZones)
 	}
 
 	records, err := c.getExistingRecords(ctx, provider, ch.ResolvedZone, ch.ResolvedFQDN)

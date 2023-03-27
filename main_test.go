@@ -75,3 +75,36 @@ func TestIsAllowedZones(t *testing.T) {
 		})
 	}
 }
+
+func TestIsAllowedZonesCNAME(t *testing.T) {
+	cfg := powerDNSProviderConfig{
+		AllowedZones: []string{"transient.one.com.", "example.com.", "default.test1-k8s-cph3.one.com."},
+	}
+
+	tests := []struct {
+		fqdn         string
+		expectedFQDN string
+		expectedZone string
+	}{
+		{
+			"_acme-challenge.x.default.test1-k8s-cph3.one.com.",
+			"_acme-challenge.x.default.test1-k8s-cph3.one.com.",
+			"default.test1-k8s-cph3.one.com.",
+		},
+		{
+			"_acme-challenge.meet.one.com.",
+			"_acme-challenge.meet.one.com.transient.one.com.",
+			"transient.one.com.",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.fqdn, func(t *testing.T) {
+			fqdn, zone, err := findZone(cfg.AllowedZones, tt.fqdn)
+			t.Log("output", fqdn, zone, err)
+			if fqdn != tt.expectedFQDN || zone != tt.expectedZone {
+				t.Errorf("Unexpected findZone([]..., %s) = %s, %s, %s, expected %s %s <nil>", tt.fqdn, fqdn, zone, err, tt.expectedFQDN, tt.expectedZone)
+			}
+		})
+	}
+}
